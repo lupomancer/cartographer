@@ -7,6 +7,7 @@ import sys
 import time
 from pathlib import Path
 
+from rich.text import Text
 from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -31,7 +32,7 @@ class Cartographer(App):
     Header { background: #12331a; color: #b6ff00; }
     Footer { background: #12331a; }
     #bar { height: 3; padding: 0 1; }
-    #net { width: 24; }
+    #net { width: 44; }
     #filter { width: 1fr; }
     Input { background: #0f1f12; border: tall #2f7a3d; color: #b6ff00; }
     DataTable { background: #0b140d; height: 1fr; }
@@ -53,7 +54,7 @@ class Cartographer(App):
 
     def __init__(self, cidr: str | None = None, ports: bool = True, autoscan: bool = True):
         super().__init__()
-        self.cidr = cidr
+        self.cidr = cidr  # comma/space separated networks; "auto" = every connected network
         self.ports = ports
         self.autoscan = autoscan
         self.hosts: dict[str, scan.Host] = {}
@@ -63,7 +64,7 @@ class Cartographer(App):
     def compose(self) -> ComposeResult:
         yield Header()
         with Horizontal(id="bar"):
-            yield Input(self.cidr or "", placeholder="CIDR e.g. 10.8.2.0/24", id="net")
+            yield Input(self.cidr or "", placeholder="networks: auto, 10.0.0.0/24 ...", id="net")
             yield Input(placeholder="/ filter by IP, name, MAC, vendor", id="filter")
         yield DataTable(id="table", cursor_type="row", zebra_stripes=True)
         yield ProgressBar(total=100, show_eta=False, id="progress")
@@ -75,12 +76,8 @@ class Cartographer(App):
         for key, label in COLUMNS:
             t.add_column(label, key=key)
         if not self.cidr:
-            nets = scan.local_networks()
-            if nets:
-                self.cidr = str(nets[0][1].network)
-                self.query_one("#net", Input).value = self.cidr
-                self.status(f"auto-selected {nets[0][0]} {self.cidr}; other nets: "
-                            + ", ".join(str(n[1].network) for n in nets[1:]) if len(nets) > 1 else "")
+            self.cidr = "auto"
+        self.query_one("#net", Input).value = self.cidr
         t.focus()
         if self.autoscan and self.cidr:
             self.action_scan()
@@ -90,18 +87,19 @@ class Cartographer(App):
 
     # ---- actions -------------------------------------------------------------------------
     def action_scan(self) -> None:
-        cidr = self.query_one("#net", Input).value.strip()
         try:
-            ipaddress.ip_network(cidr, strict=False)
-            scan.hosts_in(cidr)
+            cidrs = scan.parse_networks(self.query_one("#net", Input).value)
         except ValueError as e:
             self.status(f"bad network: {e}")
             return
-        self.cidr = cidr
+        if not cidrs:
+            self.status("no networks: none connected, enter one like 10.0.0.0/24")
+            return
+        self.cidr = ", ".join(cidrs)
         self.workers.cancel_group(self, "scan")
         self.hosts.clear()
         self.query_one(DataTable).clear()
-        self.run_scan(cidr)
+        self.run_scan(cidrs)
 
     def action_stop(self) -> None:
         self.workers.cancel_group(self, "scan")
@@ -128,23 +126,27 @@ class Cartographer(App):
 
     # ---- scan worker ---------------------------------------------------------------------
     @work(group="scan", exclusive=True)
-    async def run_scan(self, cidr: str) -> None:
+    async def run_scan(self, cidrs: list[str]) -> None:
         bar = self.query_one(ProgressBar)
         bar.update(total=100, progress=0)
         start = time.monotonic()
         alive = 0
-        async for host, done, total in scan.sweep(cidr, ports=self.ports):
+        async for host, done, total in scan.sweep(cidrs, ports=self.ports):
             bar.update(total=total, progress=done)
             if host.alive:
                 alive += 1
                 self.hosts[host.ip] = host
                 self._upsert(host)
-            self.status(f"sweeping {cidr}  {done}/{total}  contacts: {alive}")
-        self.status(f"done: {alive} contacts on {cidr} in {time.monotonic() - start:.1f}s")
+            self.status(f"sweeping {self.cidr}  {done}/{total}  contacts: {alive}")
+        self.status(f"done: {alive} contacts on {self.cidr} in {time.monotonic() - start:.1f}s")
 
     def _row(self, h: scan.Host) -> list[str]:
         return [h.ip, h.hostname, h.mac, h.vendor, f"{h.rtt:.1f} ms" if h.rtt is not None else "-",
                 _fmt_ports(h)]
+
+    def _cells(self, h: scan.Host) -> list[Text]:
+        # Text, not str: DataTable parses str cells as markup and turns ":cd:" in a MAC into an emoji
+        return [Text(c) for c in self._row(h)]
 
     def _matches(self, h: scan.Host) -> bool:
         q = self.query_one("#filter", Input).value.strip().lower()
@@ -153,13 +155,13 @@ class Cartographer(App):
     def _upsert(self, h: scan.Host) -> None:
         if not self._matches(h):
             return
-        self.query_one(DataTable).add_row(*self._row(h), key=h.ip)
+        self.query_one(DataTable).add_row(*self._cells(h), key=h.ip)
         self._resort()
 
     def _resort(self) -> None:
         t = self.query_one(DataTable)
         if self.sort_col == "ip":
-            t.sort("ip", key=lambda v: ipaddress.ip_address(v), reverse=self.sort_rev)
+            t.sort("ip", key=lambda v: ipaddress.ip_address(str(v)), reverse=self.sort_rev)
         else:
             t.sort(self.sort_col, key=lambda v: str(v).lower(), reverse=self.sort_rev)
 
@@ -168,7 +170,7 @@ class Cartographer(App):
         t.clear()
         for h in self.hosts.values():
             if self._matches(h):
-                t.add_row(*self._row(h), key=h.ip)
+                t.add_row(*self._cells(h), key=h.ip)
         self._resort()
 
     # ---- events --------------------------------------------------------------------------
@@ -192,11 +194,15 @@ class Cartographer(App):
 def main() -> None:
     import argparse
     ap = argparse.ArgumentParser(prog="cartographer", description="TUI network scanner (Advanced IP Scanner for the terminal)")
-    ap.add_argument("cidr", nargs="?", help="network to sweep; default: first up interface")
+    ap.add_argument("networks", nargs="*", help="networks to sweep (CIDR or IP); default: every connected network")
+    ap.add_argument("--auto", action="store_true", help="also sweep connected networks when networks are given")
     ap.add_argument("--no-ports", action="store_true", help="skip the port probe")
     ap.add_argument("--no-autoscan", action="store_true", help="wait for 's' before scanning")
     a = ap.parse_args()
-    Cartographer(a.cidr, ports=not a.no_ports, autoscan=not a.no_autoscan).run()
+    nets = " ".join(a.networks)
+    if a.auto and nets:
+        nets = "auto " + nets
+    Cartographer(nets or None, ports=not a.no_ports, autoscan=not a.no_autoscan).run()
     sys.exit(0)
 
 

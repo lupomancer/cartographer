@@ -176,12 +176,36 @@ def hosts_in(cidr: str) -> list[str]:
     net = ipaddress.ip_network(cidr, strict=False)
     if net.num_addresses > MAX_HOSTS:
         raise ValueError(f"{net} has {net.num_addresses} addresses; limit is {MAX_HOSTS}")
-    return [str(h) for h in net.hosts()]
+    return [str(h) for h in (net.hosts() if net.prefixlen < 31 else net)]
 
 
-async def sweep(cidr: str, ports: bool = True, concurrency: int = 96) -> AsyncIterator[tuple[Host, int, int]]:
+def auto_networks() -> list[str]:
+    """Every connected network (main LAN, VPN, ...), de-duplicated, in interface order."""
+    return list(dict.fromkeys(str(i.network) for _, i in local_networks()))
+
+
+def parse_networks(text: str) -> list[str]:
+    """Split on commas/spaces. 'auto' expands to the connected networks; bare IPs become /32.
+    Raises ValueError on a bad entry or a network over MAX_HOSTS."""
+    out: list[str] = []
+    for tok in re.split(r"[,\s]+", text.strip()):
+        if not tok:
+            continue
+        if tok.lower() == "auto":
+            out += auto_networks()
+            continue
+        net = ipaddress.ip_network(tok, strict=False)
+        hosts_in(str(net))  # size check
+        out.append(str(net))
+    return list(dict.fromkeys(out))
+
+
+async def sweep(cidrs: str | list[str], ports: bool = True,
+                concurrency: int = 96) -> AsyncIterator[tuple[Host, int, int]]:
     """Yield (host, done, total) for every address as it finishes; filter on host.alive."""
-    targets = hosts_in(cidr)
+    if isinstance(cidrs, str):
+        cidrs = [cidrs]
+    targets = list(dict.fromkeys(ip for c in cidrs for ip in hosts_in(c)))
     sem = asyncio.Semaphore(concurrency)
 
     async def one(ip: str) -> Host:
